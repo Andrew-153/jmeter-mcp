@@ -10,9 +10,14 @@ import logging
 from dotenv import load_dotenv
 
 # Configure logging
+_log_dir = Path(__file__).resolve().parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_file_handler = logging.FileHandler(_log_dir / "jmeter-mcp.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[_file_handler, logging.StreamHandler()]  # StreamHandler → stderr
 )
 logger = logging.getLogger(__name__)
 
@@ -36,10 +41,11 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
     Returns:
         str: JMeter execution output
     """
+    logger.error(f"[DIAG] run_jmeter ENTER: test_file={test_file} non_gui={non_gui}")
     try:
         # Convert to absolute path
         test_file_path = Path(test_file).resolve()
-        
+
         # Validate file exists and is a .jmx file
         if not test_file_path.exists():
             return f"Error: Test file not found: {test_file}"
@@ -54,33 +60,52 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
         logger.info(f"JMeter binary path: {jmeter_bin}")
         logger.debug(f"Java options: {java_opts}")
 
-        # Build command
-        cmd = [str(Path(jmeter_bin).resolve())]
-        
+        # Build command. On Windows, jmeter.bat uses %~dp0 internally which
+        # is unreliable when Python's subprocess invokes the .bat via cmd.exe
+        # with a list argv (the .bat ends up launching java with a garbled
+        # jarfile path like ".../jmeter.batApacheJMeter.jar"). To sidestep
+        # that, on Windows we call java.exe directly with the ApacheJMeter.jar
+        # located next to jmeter.bat; on POSIX we keep the normal launcher.
+        cmd: list[str]
+        jmeter_bin_path = Path(jmeter_bin)
+        if jmeter_bin_path.suffix.lower() == ".bat":
+            jar_path = jmeter_bin_path.parent / "ApacheJMeter.jar"
+            if not jar_path.exists():
+                return f"Error: ApacheJMeter.jar not found next to {jmeter_bin}: {jar_path}"
+            java_opts_list = [o for o in java_opts.split() if o]
+            cmd = ["java.exe", *java_opts_list, "-jar", str(jar_path)]
+        else:
+            cmd = [str(jmeter_bin_path.resolve())]
+
         if non_gui:
             cmd.extend(['-n'])
         cmd.extend(['-t', str(test_file_path)])
-        
+
         # Add JMeter properties if provided∑
         if properties:
             for prop_name, prop_value in properties.items():
                 cmd.extend([f'-J{prop_name}={prop_value}'])
                 logger.debug(f"Adding property: -J{prop_name}={prop_value}")
-        
+
+        # Always honour an explicit log_file (writes JTL).
+        if non_gui and log_file:
+            cmd.extend(['-l', log_file])
+            logger.debug(f"Logging samples to: {log_file}")
+
         # Add report generation options if requested
         if generate_report and non_gui:
+            # If log_file wasn't provided, synthesise one next to the report dir
             if log_file is None:
-                # Generate unique log file name if not specified
                 unique_id = generate_unique_id()
                 log_file = f"{test_file_path.stem}_{unique_id}_results.jtl"
+                cmd.extend(['-l', log_file])
                 logger.debug(f"Using generated unique log file: {log_file}")
-            
-            cmd.extend(['-l', log_file])
+
             cmd.extend(['-e'])
-            
+
             # Always ensure report_output_dir is unique
             unique_id = unique_id if 'unique_id' in locals() else generate_unique_id()
-            
+
             if report_output_dir:
                 # Append unique identifier to user-provided report directory
                 original_dir = report_output_dir
@@ -90,16 +115,31 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
                 # Generate unique report output directory if not specified
                 report_output_dir = f"{test_file_path.stem}_{unique_id}_report"
                 logger.debug(f"Using generated unique report output directory: {report_output_dir}")
-                
+
             cmd.extend(['-o', report_output_dir])
 
         # Log the full command for debugging
         logger.debug(f"Executing command: {' '.join(cmd)}")
-        
+
         if non_gui:
             # For non-GUI mode, capture output
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
+            import time
+            t0 = time.time()
+            logger.error(f"[DIAG] before subprocess.run at {t0:.2f}")
+            try:
+                # stdin=DEVNULL prevents jmeter.bat's cmd.exe wrapper from blocking
+                # on "Press any key to continue . . ." at the end of the run.
+                # Without this, on Windows the child inherits the MCP server's
+                # stdin (a pipe from the Kilo client), which never sends a key,
+                # so the subprocess hangs forever and the MCP request times out.
+                result = subprocess.run(cmd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=600)
+            except subprocess.TimeoutExpired:
+                logger.error("[DIAG] subprocess.run TIMED OUT after 600s")
+                return "Error: JMeter run exceeded 600s and was killed"
+            logger.error(f"[DIAG] after subprocess.run at {time.time():.2f} (took {time.time()-t0:.2f}s) rc={result.returncode}")
+            logger.error(f"[DIAG] STDOUT (last 500): {result.stdout[-500:]!r}")
+            logger.error(f"[DIAG] STDERR (last 500): {result.stderr[-500:]!r}")
+
             # Log output for debugging
             logger.debug("Command output:")
             logger.debug(f"Return code: {result.returncode}")
@@ -108,7 +148,7 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
 
             if result.returncode != 0:
                 return f"Error executing JMeter test:\n{result.stderr}"
-            
+
             return result.stdout
         else:
             # For GUI mode, start process without capturing output
@@ -116,7 +156,10 @@ async def run_jmeter(test_file: str, non_gui: bool = True, properties: dict = No
             return "JMeter GUI launched successfully"
 
     except Exception as e:
+        logger.error(f"[DIAG] run_jmeter EXCEPTION: {e!r}")
         return f"Unexpected error: {str(e)}"
+    finally:
+        logger.error("[DIAG] run_jmeter EXIT")
 
 @mcp.tool()
 async def execute_jmeter_test(test_file: str, gui_mode: bool = False, properties: dict = None) -> str:
@@ -127,7 +170,14 @@ async def execute_jmeter_test(test_file: str, gui_mode: bool = False, properties
         gui_mode: Whether to run in GUI mode (default: False)
         properties: Dictionary of JMeter properties to pass with -J (default: None)
     """
-    return await run_jmeter(test_file, non_gui=not gui_mode, properties=properties)  # Run in non-GUI mode by default
+    logger.error("[DIAG] execute_jmeter_test ENTER")
+    try:
+        r = await run_jmeter(test_file, non_gui=not gui_mode, properties=properties)
+        logger.error(f"[DIAG] execute_jmeter_test RETURN (len={len(r)})")
+        return r
+    except Exception as e:
+        logger.error(f"[DIAG] execute_jmeter_test EXC: {e!r}")
+        raise
 
 @mcp.tool()
 async def execute_jmeter_test_non_gui(test_file: str, properties: dict = None, generate_report: bool = False, report_output_dir: str = None, log_file: str = None) -> str:
@@ -140,7 +190,14 @@ async def execute_jmeter_test_non_gui(test_file: str, properties: dict = None, g
         report_output_dir: Output folder for report dashboard (default: None)
         log_file: Name of JTL file to log sample results to (default: None)
     """
-    return await run_jmeter(test_file, non_gui=True, properties=properties, generate_report=generate_report, report_output_dir=report_output_dir, log_file=log_file)
+    logger.error("[DIAG] execute_jmeter_test_non_gui ENTER")
+    try:
+        r = await run_jmeter(test_file, non_gui=True, properties=properties, generate_report=generate_report, report_output_dir=report_output_dir, log_file=log_file)
+        logger.error(f"[DIAG] execute_jmeter_test_non_gui RETURN (len={len(r)})")
+        return r
+    except Exception as e:
+        logger.error(f"[DIAG] execute_jmeter_test_non_gui EXC: {e!r}")
+        raise
 
 # Import the analyzer module
 from analyzer.models import TestResults
